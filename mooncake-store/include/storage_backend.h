@@ -1158,6 +1158,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      *         NO_AVAILABLE_DISK if no disk can hold the incoming bucket;
      *         FILE_WRITE_FAIL if the quota is still exceeded afterwards.
      */
+    // True if any disk has a write reserved but not yet committed.
+    bool HasPendingWrites() const;
+
     tl::expected<PendingEviction, ErrorCode> PrepareEviction(
         int64_t required_size, const std::vector<std::string>& write_keys = {},
         int disk_hint = -1);
@@ -1245,6 +1248,13 @@ class BucketStorageBackend : public StorageBackendInterface {
             size += disk.lru_index.size();
         }
         return size;
+    }
+
+    // Test-only: reserve / release bytes as if another write were in flight
+    // on the given disk (reserved by PrepareEviction, not yet committed).
+    void AddPendingWriteForTest(int disk_index, int64_t bytes) {
+        SharedMutexLocker lock(&mutex_);
+        disks_[disk_index].pending_write_size += bytes;
     }
 
     // Test-only: effective per-disk quota after Init() has applied defaults.

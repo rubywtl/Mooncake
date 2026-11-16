@@ -164,6 +164,7 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** bytes (`du`-equivalent) under this backend's `ssd_offload_path`, applied **per disk** when several are configured. `0` disables it. With per-rank directories (required), the cap is per-rank — see below. |
 | `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<= 0` scans on every check. |
+| `MOONCAKE_OFFLOAD_BUCKET_FULL_RETRY_MS` | `0` | When a write does not fit because the quota is held by writes still in flight (not yet committed, so not evictable), wait up to this many ms for them and retry instead of dropping the write. Waits only while another write is in flight; runs on the offload thread. `<= 0` disables. |
 
 For `packed` direct bucket writes, each writing thread retains a 4096-byte-aligned buffer
 that grows to fit its largest bucket and is released when the thread exits.

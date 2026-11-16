@@ -1724,6 +1724,28 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     }
     const int64_t required_size = file_bytes + bucket->meta_size;
     auto prepare_result = PrepareEviction(required_size, bucket->keys);
+    // A full disk whose quota is held by in-flight writes rejects this write
+    // even after evicting every committed bucket: in-flight writes are not
+    // evictable yet. They commit shortly, so wait for them and retry rather
+    // than dropping the write.
+    if (!prepare_result &&
+        prepare_result.error() == ErrorCode::FILE_WRITE_FAIL &&
+        bucket_backend_config_.full_retry_ms > 0) {
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(bucket_backend_config_.full_retry_ms);
+        std::chrono::milliseconds backoff(5);
+        while (!prepare_result &&
+               prepare_result.error() == ErrorCode::FILE_WRITE_FAIL &&
+               HasPendingWrites() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(backoff);
+            backoff = std::min(backoff * 2, std::chrono::milliseconds(100));
+            prepare_result = PrepareEviction(required_size, bucket->keys);
+        }
+        VLOG(1) << "Full-disk retry for bucket " << bucket_id << ": "
+                << (prepare_result ? "recovered" : "gave up");
+    }
     if (!prepare_result) {
         return tl::make_unexpected(prepare_result.error());
     }
@@ -3449,6 +3471,14 @@ BucketStorageBackend::SelectEvictionCandidate(int disk_index) {
         default:
             return buckets_.end();
     }
+}
+
+bool BucketStorageBackend::HasPendingWrites() const {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    for (const auto& disk : disks_) {
+        if (disk.pending_write_size > 0) return true;
+    }
+    return false;
 }
 
 tl::expected<int, ErrorCode> BucketStorageBackend::SelectDiskForWrite(

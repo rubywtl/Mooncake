@@ -67,6 +67,14 @@ struct BucketBackendConfig {
     // max_physical_bytes > 0.
     int64_t disk_scan_cache_ms = 500;
 
+    // When a write is rejected because the disk quota is taken by other
+    // writes that are still in flight (reserved but not yet committed, so
+    // not evictable), wait up to this many milliseconds for them to commit
+    // and retry, instead of dropping the write. Only waits while another
+    // write is actually in flight. <= 0 disables the retry (reject at once).
+    // Note: the wait runs on the offload thread.
+    int64_t full_retry_ms = 0;
+
     // Write the final partial bucket in the current offload cycle instead of
     // carrying keys into a later cycle without their current offload tasks.
     bool flush_partial_buckets = false;

@@ -49,6 +49,7 @@ struct BucketBackendEnvironment {
         "MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES"};
     ScopedEnvVar disk_scan_cache_ms{
         "MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS"};
+    ScopedEnvVar full_retry_ms{"MOONCAKE_OFFLOAD_BUCKET_FULL_RETRY_MS"};
     ScopedEnvVar eviction_policy{"MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY"};
     ScopedEnvVar legacy_eviction_policy{"MOONCAKE_BUCKET_EVICTION_POLICY"};
     ScopedEnvVar flush_partial_buckets{
@@ -178,6 +179,13 @@ TEST_F(BucketBackendConfigTest, InvalidIntegersUseIndividualDefaults) {
                 << name << '=' << value;
         }
     }
+}
+
+TEST_F(BucketBackendConfigTest, FullRetryMsDefaultsOffAndParses) {
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().full_retry_ms, 0);
+    env.full_retry_ms.Set("3000");
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().value().full_retry_ms,
+              3000);
 }
 
 TEST_F(BucketBackendConfigTest, PreferredTotalSizeOverridesLegacyAlias) {

@@ -4021,6 +4021,86 @@ TEST_F(StorageBackendTest,
     EXPECT_EQ(std::string(load_buffer.begin(), load_buffer.end()), old_value);
 }
 
+// A write that does not fit because the quota is held by writes still in
+// flight (reserved, not yet committed, so not evictable) is rejected at once
+// by default, and with full_retry_ms > 0 waits for them and then succeeds.
+namespace {
+BucketBackendConfig FullDiskBucketConfig(int64_t full_retry_ms) {
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 10 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::FIFO;
+    bucket_config.full_retry_ms = full_retry_ms;
+    return bucket_config;
+}
+
+tl::expected<int64_t, ErrorCode> OffloadOne(BucketStorageBackend& backend,
+                                            const std::string& key,
+                                            std::string& value) {
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{value.data(), value.size()}});
+    return backend.BatchOffload(
+        batch, [](const std::vector<std::string>&,
+                  std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+}
+}  // namespace
+
+TEST_F(StorageBackendTest, BucketFullDiskInFlightRejectsWithoutRetry) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, FullDiskBucketConfig(0));
+    ASSERT_TRUE(backend.Init());
+
+    backend.AddPendingWriteForTest(0, 8 * 1024);  // another write in flight
+    std::string value(6 * 1024, 'A');
+    auto result = OffloadOne(backend, "k", value);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+    backend.AddPendingWriteForTest(0, -8 * 1024);
+}
+
+TEST_F(StorageBackendTest, BucketFullDiskInFlightRetrySucceeds) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, FullDiskBucketConfig(5000));
+    ASSERT_TRUE(backend.Init());
+
+    backend.AddPendingWriteForTest(0, 8 * 1024);
+    std::thread committer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        backend.AddPendingWriteForTest(0, -8 * 1024);  // in-flight write done
+    });
+    std::string value(6 * 1024, 'B');
+    auto result = OffloadOne(backend, "k", value);
+    committer.join();
+    ASSERT_TRUE(result.has_value()) << result.error();
+
+    std::vector<char> buffer(value.size());
+    std::unordered_map<std::string, Slice> load;
+    load.emplace("k", Slice{buffer.data(), buffer.size()});
+    ASSERT_TRUE(backend.BatchLoad(load).has_value());
+    EXPECT_EQ(std::string(buffer.begin(), buffer.end()), value);
+}
+
+TEST_F(StorageBackendTest, BucketFullDiskInFlightRetryHonorsDeadline) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, FullDiskBucketConfig(100));
+    ASSERT_TRUE(backend.Init());
+
+    backend.AddPendingWriteForTest(0, 8 * 1024);  // never commits
+    std::string value(6 * 1024, 'C');
+    const auto start = std::chrono::steady_clock::now();
+    auto result = OffloadOne(backend, "k", value);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_GE(elapsed, std::chrono::milliseconds(100));
+    EXPECT_LT(elapsed, std::chrono::seconds(2));
+    backend.AddPendingWriteForTest(0, -8 * 1024);
+}
+
 TEST_F(StorageBackendTest,
        BucketRollbackPreservesCapacityAgainstConcurrentWrite) {
     FileStorageConfig config;

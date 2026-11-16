@@ -1059,6 +1059,14 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         if (!offload_result) {
             LOG(ERROR) << "Failed to persist objects with error: "
                        << offload_result.error();
+            // A failed batch is most often a full disk, which is exactly
+            // when proactive watermark eviction is needed; returning here
+            // used to skip it.
+            auto disk_eviction_result = RunDiskWatermarkEviction();
+            if (!disk_eviction_result) {
+                LOG(WARNING) << "Disk watermark eviction failed: "
+                             << disk_eviction_result.error();
+            }
             return offload_result;
         }
     }
