@@ -1067,6 +1067,18 @@ ErrorCode Client::InitTransferEngine(
                               "devices";
                 return ErrorCode::INTERNAL_ERROR;
             }
+            // Dual mode: also install EFA for peers whose segment protocol is "efa"
+            if (protocol == "rdma") {
+                const char* extra_efa = std::getenv("MC_EXTRA_EFA_DEVICES");
+                if (extra_efa && *extra_efa) {
+                    Transport* efa = transfer_engine_->installTransport("efa", nullptr);
+                    if (!efa) {
+                        LOG(ERROR) << "Failed to install extra EFA transport on " << extra_efa;
+                        return ErrorCode::INTERNAL_ERROR;
+                    }
+                    LOG(INFO) << "Installed extra EFA transport on " << extra_efa;
+                }
+            }
         } else if (protocol == "tcp") {
             if (device_names.has_value()) {
                 LOG(WARNING)

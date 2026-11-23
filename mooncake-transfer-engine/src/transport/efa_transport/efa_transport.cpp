@@ -26,13 +26,16 @@
 #include <cstdlib>
 #include <future>
 #include <set>
+#include <sstream>
 #include <thread>
+#include <unordered_set>
 
 #include <dlfcn.h>
 #include <infiniband/verbs.h>
 
 #include "common.h"
 #include "config.h"
+#include "cuda_alike.h"
 #include "memory_location.h"
 #include "transport/efa_transport/efa_discovery.h"
 #include "transport/efa_transport/efa_neuron.h"
@@ -137,6 +140,29 @@ int EfaTransport::install(std::string& local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
     local_topology_ = topo;
+    // Dual mode (alongside RDMA): use a private topology holding only the EFA devices, so the
+    // EFA filter below does not disable the RDMA transport's NICs in the shared topology
+    // MC_EXTRA_EFA_DEVICES="auto" uses every EFA NIC libfabric offers; otherwise a comma-separated list.
+    if (const char* extra_efa = std::getenv("MC_EXTRA_EFA_DEVICES"); extra_efa && *extra_efa) {
+        std::vector<std::string> devs;
+        if (std::string(extra_efa) == "auto") {
+            std::vector<EfaNic> nics;
+            std::string error;
+            if (!listEfaNics(nics, &error) || nics.empty()) {
+                LOG(ERROR) << "EfaTransport: MC_EXTRA_EFA_DEVICES=auto found no EFA NICs: " << error;
+                return ERR_DEVICE_NOT_FOUND;
+            }
+            for (const auto& nic : nics) devs.push_back(nic.name);
+        } else {
+            std::stringstream ss(extra_efa);
+            for (std::string d; std::getline(ss, d, ',');)
+                if (!d.empty()) devs.push_back(d);
+        }
+        auto own = std::make_shared<Topology>();
+        own->discover(devs);
+        local_topology_ = own;
+        LOG(INFO) << "EfaTransport: private topology with " << devs.size() << " EFA devices";
+    }
 
     std::string fabric_error;
     if (!loadLibfabric(&fabric_error)) {
@@ -157,7 +183,7 @@ int EfaTransport::install(std::string& local_server_name,
         return ret;
     }
 
-    ret = startHandshakeDaemon(local_server_name);
+    ret = private_desc_ ? 0 : startHandshakeDaemon(local_server_name);  // dual mode: RDMA keeps the handshake handler
     if (ret) {
         LOG(ERROR) << "EfaTransport: cannot start handshake daemon";
         return ret;
@@ -217,6 +243,25 @@ int EfaTransport::preTouchMemory(void* addr, size_t length) {
     return 0;
 }
 
+
+// Dual mode: skip EFA registration of large host buffers (peers reach them over RDMA)
+namespace {
+std::mutex g_dual_skip_mu;
+std::unordered_set<uint64_t> g_dual_skipped;
+bool dualSkipHost(void* addr, size_t length) {
+    static const size_t thr = [] { const char* v = std::getenv("MC_DUAL_EFA_SKIP_HOST_GB");
+        return (size_t)((v && *v) ? std::atof(v) : 16.0) * (1ull << 30); }();
+    if (length < thr) return false;
+#ifdef USE_CUDA
+    cudaPointerAttributes attr;
+    cudaError_t st = cudaPointerGetAttributes(&attr, addr);
+    if (st != cudaSuccess) { (void)cudaGetLastError(); return true; }
+    return !(attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged);
+#else
+    return true;  // no GPU memory without CUDA: a large buffer is host memory
+#endif
+}
+}  // namespace
 int EfaTransport::registerLocalMemory(void* addr, size_t length,
                                       const std::string& name,
                                       bool remote_accessible,
@@ -228,6 +273,13 @@ int EfaTransport::registerLocalMemory(void* addr, size_t length,
 int EfaTransport::registerLocalMemoryInternal(
     void* addr, size_t length, const std::string& name, bool remote_accessible,
     bool update_metadata, bool force_sequential, ThpPlan thp_plan) {
+    if (private_desc_ && dualSkipHost(addr, length)) {
+        std::lock_guard<std::mutex> lk(g_dual_skip_mu);
+        g_dual_skipped.insert((uint64_t)addr);
+        LOG(INFO) << "EfaTransport dual: skip host buffer " << addr << " len " << length
+                  << " (tray<->tray traffic for it uses RDMA)";
+        return 0;
+    }
     // Like RdmaTransport: a buffer that is not remote-accessible gets an MR
     // without remote rights and publishes no rkey, so peers cannot target it.
     int access_rights = IBV_ACCESS_LOCAL_WRITE;
@@ -605,7 +657,8 @@ int EfaTransport::registerLocalMemoryInternal(
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
         buffer_desc.length = chunk_len;
-        int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+        int rc = private_desc_ ? privateAddBuffer(buffer_desc)
+                               : metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
         if (rc) {
             rollbackChunks(ci);
             return rc;
@@ -633,6 +686,10 @@ int EfaTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
 int EfaTransport::unregisterLocalMemoryInternal(void* addr,
                                                 bool update_metadata,
                                                 bool force_sequential) {
+    {
+        std::lock_guard<std::mutex> lk(g_dual_skip_mu);
+        if (g_dual_skipped.erase((uint64_t)addr)) return 0;
+    }
     // Check if this buffer was split into chunks (per-NIC partition)
     std::vector<ChunkRegistration> chunk_regs;
     {
@@ -648,7 +705,8 @@ int EfaTransport::unregisterLocalMemoryInternal(void* addr,
         // Unregister each chunk from its assigned NICs only
         for (auto& reg : chunk_regs) {
             void* ca = (void*)reg.addr;
-            int rc = metadata_->removeLocalMemoryBuffer(ca, update_metadata);
+            int rc = private_desc_ ? privateRemoveBuffer(ca)
+                                   : metadata_->removeLocalMemoryBuffer(ca, update_metadata);
             if (rc) {
                 LOG(ERROR) << "Failed to remove chunk metadata at " << ca;
                 return rc;
@@ -667,7 +725,8 @@ int EfaTransport::unregisterLocalMemoryInternal(void* addr,
     }
 
     // Non-chunked buffer: original path
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = private_desc_ ? privateRemoveBuffer(addr)
+                           : metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
 
     int use_parallel_unreg = 0;
@@ -729,9 +788,39 @@ int EfaTransport::allocateLocalSegmentID() {
         desc->devices.push_back(device_desc);
     }
     desc->topology = *(local_topology_.get());
+    if (std::getenv("MC_EXTRA_EFA_DEVICES") && *std::getenv("MC_EXTRA_EFA_DEVICES")) {
+        private_desc_ = true;  // dual mode: keep the RDMA transport's published descriptor
+        std::atomic_store(&private_local_desc_, std::shared_ptr<SegmentDesc>(std::move(desc)));
+        LOG(INFO) << "EfaTransport: private local descriptor (RDMA keeps the published one)";
+        return 0;
+    }
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
+}
+
+int EfaTransport::privateAddBuffer(const TransferMetadata::BufferDesc& b) {
+    std::lock_guard<std::mutex> g(private_desc_mutex_);
+    auto cur = std::atomic_load(&private_local_desc_);
+    auto next = std::make_shared<SegmentDesc>(*cur);
+    next->buffers.push_back(b);
+    std::atomic_store(&private_local_desc_, next);
+    return 0;
+}
+
+int EfaTransport::privateRemoveBuffer(void* addr) {
+    std::lock_guard<std::mutex> g(private_desc_mutex_);
+    auto cur = std::atomic_load(&private_local_desc_);
+    auto next = std::make_shared<SegmentDesc>(*cur);
+    auto& v = next->buffers;
+    v.erase(std::remove_if(v.begin(), v.end(), [&](const BufferDesc& b) { return b.addr == (uint64_t)addr; }), v.end());
+    std::atomic_store(&private_local_desc_, next);
+    return 0;
+}
+
+std::shared_ptr<TransferMetadata::SegmentDesc> EfaTransport::localDesc() {
+    if (private_desc_) return std::atomic_load(&private_local_desc_);
+    return metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
 }
 
 // Optional concurrency cap for the batch register/unregister fan-out below, set
@@ -1054,7 +1143,7 @@ Status EfaTransport::submitTransferTask(
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
         target_segment_descs;
     std::unordered_set<SegmentID> refreshed_targets;
-    auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    auto local_segment_desc = localDesc();
     assert(local_segment_desc.get());
     const int kMaxRetryCount = globalConfig().retry_cnt;
 

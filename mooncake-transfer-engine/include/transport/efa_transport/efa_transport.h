@@ -189,6 +189,13 @@ class EfaTransport : public Transport {
    private:
     std::vector<std::shared_ptr<EfaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
+    // Dual RDMA + EFA mode: private local descriptor, copy-on-write via atomic shared_ptr swaps
+    bool private_desc_ = false;
+    std::shared_ptr<TransferMetadata::SegmentDesc> private_local_desc_;
+    std::mutex private_desc_mutex_;
+    int privateAddBuffer(const TransferMetadata::BufferDesc& b);
+    int privateRemoveBuffer(void* addr);
+    std::shared_ptr<TransferMetadata::SegmentDesc> localDesc();
 
     // Memory location -> context_list_ indices of the topology-local NICs,
     // built once in initializeEfaResources(). Only read when
